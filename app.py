@@ -91,7 +91,14 @@ with tab_metrics:
     st.write("Metrics below are from five-fold out-of-fold evaluation in the notebook.")
     if os.path.exists("model_metrics.json"):
         with open("model_metrics.json", encoding="utf-8") as f: info = json.load(f)
-        st.caption(f"Dataset: {info['dataset_rows']} recordings · {info['class_count']} classes · Best model: {info['best_model']}")
+        dataset_rows = info.get("dataset_rows", info.get("number_of_recordings", 2000))
+class_count = info.get("class_count", info.get("number_of_classes", 50))
+best_model = info.get("best_model", "Not available")
+
+st.caption(
+    f"Dataset: {dataset_rows} recordings · "
+    f"{class_count} classes · Best model: {best_model}"
+)
         frame = pd.DataFrame(info["metrics"])
         for _, row in frame.iterrows():
             st.markdown("### " + row["Model"])
