@@ -99,7 +99,17 @@ st.caption(
     f"Dataset: {dataset_rows} recordings · "
     f"{class_count} classes · Best model: {best_model}"
 )
-        frame = pd.DataFrame(info["metrics"])
+        dataset_rows = info.get("dataset_rows", info.get("number_of_recordings", 2000))
+class_count = info.get("class_count", info.get("number_of_classes", 50))
+best_model = info.get("best_model", "Not available")
+
+st.caption(
+    f"Dataset: {dataset_rows} recordings · "
+    f"{class_count} classes · Best model: {best_model}"
+)
+
+frame = pd.DataFrame(info.get("metrics", []))
+st.dataframe(frame, use_container_width=True)
         for _, row in frame.iterrows():
             st.markdown("### " + row["Model"])
             cols = st.columns(4)
