@@ -1,7 +1,27 @@
-import json, os, tempfile
-import joblib, librosa, numpy as np, pandas as pd, streamlit as st
+import io
+import json
+import os
+import tempfile
+from pathlib import Path
 
-st.set_page_config(page_title="Auralert | Environmental AI", page_icon="🔊", layout="wide")
+import joblib
+import librosa
+import numpy as np
+import pandas as pd
+import streamlit as st
+
+APP_DIR = Path(__file__).resolve().parent
+MODEL_PATH = APP_DIR / "model_bundle.joblib"
+METRICS_JSON_PATH = APP_DIR / "model_metrics.json"
+METRICS_CSV_PATH = APP_DIR / "model_metrics.csv"
+SAMPLE_RATE = 22050
+
+st.set_page_config(
+    page_title="Auralert | Environmental AI",
+    page_icon="🔊",
+    layout="wide"
+)
+
 st.markdown("""
 <style>
 @import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=Space+Grotesk:wght@500;600;700&display=swap');
@@ -19,121 +39,423 @@ h1,h2,h3{font-family:'Space Grotesk',sans-serif}
 </style>
 """, unsafe_allow_html=True)
 
-@st.cache_resource
-def load_bundle():
-    return joblib.load("model_bundle.joblib")
 
-def extract_features(path):
-    audio, sr = librosa.load(path, sr=22050, mono=True)
-    mfcc = librosa.feature.mfcc(y=audio, sr=sr, n_mfcc=13)
-    mfcc_summary = np.concatenate([mfcc.mean(axis=1), mfcc.std(axis=1)])
-    centroid = librosa.feature.spectral_centroid(y=audio, sr=sr)[0]
+def get_model_url():
+    try:
+        url = st.secrets.get("MODEL_URL", "")
+    except Exception:
+        url = ""
+    return url or os.getenv("MODEL_URL", "")
+
+
+@st.cache_resource(show_spinner="Loading Auralert's trained model...")
+def load_bundle():
+    if MODEL_PATH.exists():
+        return joblib.load(MODEL_PATH)
+
+    url = get_model_url()
+
+    if not url:
+        raise FileNotFoundError(
+            "Model file is missing. Configure MODEL_URL in Streamlit Secrets."
+        )
+
+    import requests
+
+    response = requests.get(url, timeout=180)
+    response.raise_for_status()
+
+    temp_model = Path(tempfile.gettempdir()) / "auralert_model_bundle.joblib"
+    temp_model.write_bytes(response.content)
+
+    return joblib.load(temp_model)
+
+
+def extract_features(audio, sr=SAMPLE_RATE, n_mfcc=13):
+    if audio.ndim > 1:
+        audio = librosa.to_mono(audio)
+
+    audio = audio.astype(np.float32)
+
+    if audio.size == 0:
+        raise ValueError("The uploaded audio is empty.")
+
+    mfcc = librosa.feature.mfcc(
+        y=audio,
+        sr=sr,
+        n_mfcc=n_mfcc
+    )
+
+    centroid = librosa.feature.spectral_centroid(
+        y=audio, sr=sr
+    )[0]
+
     zcr = librosa.feature.zero_crossing_rate(audio)[0]
-    rolloff = librosa.feature.spectral_rolloff(y=audio, sr=sr)[0]
-    spectral = np.array([centroid.mean(), centroid.std(), zcr.mean(), zcr.std(), rolloff.mean(), rolloff.std()])
-    return np.concatenate([mfcc_summary, spectral]).reshape(1,-1), audio, sr
+
+    rolloff = librosa.feature.spectral_rolloff(
+        y=audio, sr=sr
+    )[0]
+
+    summary = np.concatenate([
+        mfcc.mean(axis=1),
+        mfcc.std(axis=1),
+        [
+            centroid.mean(),
+            centroid.std(),
+            zcr.mean(),
+            zcr.std(),
+            rolloff.mean(),
+            rolloff.std()
+        ]
+    ])
+
+    return summary.reshape(1, -1)
+
+
+def read_metrics():
+    if not METRICS_JSON_PATH.exists():
+        return {}
+
+    with METRICS_JSON_PATH.open("r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def first_present(data, keys, default=None):
+    for key in keys:
+        if key in data and data[key] is not None:
+            return data[key]
+
+    return default
+
+
+st.markdown("""
+<div class="hero">
+    <div class="kicker">AUDIO INTELLIGENCE LAB · MACHINE LEARNING</div>
+    <h1>🔊 Auralert</h1>
+    <p><b>Hear the world. Detect the unexpected.</b></p>
+    <p>Upload an environmental recording and classify it across the sound categories learned by the model.</p>
+</div>
+""", unsafe_allow_html=True)
+
 
 try:
     bundle = load_bundle()
-except Exception:
-    st.error("Model file missing. Run the notebook, download model_bundle.joblib, and put it beside app.py.")
+
+except Exception as error:
+    st.error("Auralert could not load its trained model.")
+
+    st.markdown("""
+**If the model file is too large for GitHub:**
+
+1. Host `model_bundle.joblib` on a file-hosting service that permits direct downloads.
+2. Open Streamlit Cloud → **Manage app → Settings → Secrets**.
+3. Add `MODEL_URL` containing the direct download URL.
+4. Keep `app.py`, `requirements.txt`, `model_metrics.json`, and `model_metrics.csv` in GitHub.
+""")
+
+    st.caption(f"Technical detail: {error}")
     st.stop()
 
-st.markdown("""<div class="hero"><div class="kicker">AUDIO INTELLIGENCE LAB · MACHINE LEARNING</div>
-<h1>🔊 Auralert</h1><p>Hear the world. Detect the unexpected. Upload an environmental recording and classify it across 50 sound categories.</p></div>""", unsafe_allow_html=True)
 
-tab_demo, tab_metrics, tab_about = st.tabs(["🎧 Sound Lab", "📊 Model Performance", "🧠 How it works"])
+if not isinstance(bundle, dict) or "model" not in bundle:
+    st.error(
+        "The model bundle must contain a 'model' entry. "
+        "Use the model_bundle.joblib generated by the Auralert notebook."
+    )
+    st.stop()
+
+
+tab_demo, tab_metrics, tab_about = st.tabs([
+    "🎧 Sound Lab",
+    "📊 Model Performance",
+    "🧠 How it works"
+])
+
+
+# ---------------- SOUND LAB ----------------
+
 with tab_demo:
-    left, right = st.columns([1,1], gap="large")
+    left, right = st.columns([1, 1], gap="large")
+
     with left:
         st.subheader("Try a sound")
-        st.write("Upload a short WAV, MP3, OGG, FLAC or M4A recording.")
-        uploaded = st.file_uploader("Choose an audio file", type=["wav","mp3","ogg","flac","m4a"])
+
+        st.write(
+            "Upload a short WAV, MP3, OGG, FLAC or M4A recording."
+        )
+
+        uploaded = st.file_uploader(
+            "Choose an audio file",
+            type=["wav", "mp3", "ogg", "flac", "m4a"]
+        )
+
         if uploaded:
             st.audio(uploaded)
-            if st.button("✨ Analyze this sound", type="primary", use_container_width=True):
-                temp_path = None
+
+            if st.button(
+                "✨ Analyze this sound",
+                type="primary",
+                use_container_width=True
+            ):
                 try:
-                    suffix = os.path.splitext(uploaded.name)[1] or ".wav"
-                    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-                        tmp.write(uploaded.getbuffer()); temp_path = tmp.name
-                    with st.spinner("Listening to the audio features..."):
-                        feats, audio, sr = extract_features(temp_path)
+                    with st.spinner("Analyzing audio features..."):
+                        audio, sr = librosa.load(
+                            io.BytesIO(uploaded.getvalue()),
+                            sr=SAMPLE_RATE,
+                            mono=True,
+                            duration=30
+                        )
+
+                        n_mfcc = int(bundle.get("n_mfcc", 13))
+
+                        features = extract_features(
+                            audio, sr, n_mfcc
+                        )
+
                         model = bundle["model"]
-                        pred = model.predict(feats)[0]
-                        scores = model.predict_proba(feats)[0] if hasattr(model,"predict_proba") else None
-                        st.session_state["prediction"] = {"name":str(pred), "filename":uploaded.name, "duration":len(audio)/sr,
-                                                          "scores":scores, "classes":bundle["classes"]}
-                except Exception as e:
-                    st.error(f"Could not analyze this recording: {e}")
-                finally:
-                    if temp_path and os.path.exists(temp_path): os.remove(temp_path)
+                        prediction = model.predict(features)[0]
+
+                        scores = (
+                            model.predict_proba(features)[0]
+                            if hasattr(model, "predict_proba")
+                            else None
+                        )
+
+                        classes = list(
+                            getattr(
+                                model,
+                                "classes_",
+                                bundle.get("classes", [])
+                            )
+                        )
+
+                        st.session_state["auralert_prediction"] = {
+                            "name": str(prediction),
+                            "filename": uploaded.name,
+                            "duration": len(audio) / sr if sr else 0,
+                            "scores": scores,
+                            "classes": classes
+                        }
+
+                except Exception as error:
+                    st.error("Auralert could not analyze this recording.")
+                    st.caption(f"Technical detail: {error}")
+
     with right:
         st.subheader("Prediction")
-        result = st.session_state.get("prediction")
+
+        result = st.session_state.get("auralert_prediction")
+
         if result:
-            st.markdown(f"""<div class="metric-card"><div class="metric-label">PREDICTED SOUND</div>
-            <div class="metric-value">🔎 {result['name'].replace('_',' ').title()}</div>
-            <div class="note">File: {result['filename']} · {result['duration']:.1f} seconds</div></div>""", unsafe_allow_html=True)
-            if result["scores"] is not None:
-                ix = np.argsort(result["scores"])[::-1][:5]
-                top = pd.DataFrame({"Category":[str(result["classes"][i]).replace("_"," ").title() for i in ix],
-                                    "Model score":[float(result["scores"][i]) for i in ix]})
+            st.markdown(f"""
+<div class="metric-card">
+    <div class="metric-label">PREDICTED SOUND</div>
+    <div class="metric-value">
+        🔎 {result['name'].replace('_', ' ').title()}
+    </div>
+    <div class="note">
+        File: {result['filename']} · {result['duration']:.1f} seconds
+    </div>
+</div>
+""", unsafe_allow_html=True)
+
+            st.caption(
+                "Predictions can be wrong, especially for unfamiliar, "
+                "mixed, or noisy recordings."
+            )
+
+            if result["scores"] is not None and result["classes"]:
+                indexes = np.argsort(result["scores"])[::-1][:5]
+
+                top = pd.DataFrame({
+                    "Category": [
+                        str(result["classes"][i]).replace("_", " ").title()
+                        for i in indexes
+                    ],
+                    "Model score": [
+                        float(result["scores"][i])
+                        for i in indexes
+                    ]
+                })
+
                 st.write("Top 5 candidate categories")
                 st.bar_chart(top.set_index("Category"))
-                st.caption("Scores are model estimates and are not guarantees of real-world correctness.")
+
         else:
-            st.info("Upload a recording and click Analyze to see a prediction.")
-            st.write("Demo ideas: dog bark, rain, siren, keyboard typing, helicopter, or footsteps.")
+            st.info(
+                "Upload a recording and click Analyze to see a prediction."
+            )
+
+            st.write(
+                "Demo ideas: dog bark, rain, siren, keyboard typing, "
+                "helicopter, or footsteps."
+            )
+
+
+# ---------------- MODEL PERFORMANCE ----------------
 
 with tab_metrics:
     st.subheader("Measured model performance")
-    st.write("Metrics below are from five-fold out-of-fold evaluation in the notebook.")
-    if os.path.exists("model_metrics.json"):
-        with open("model_metrics.json", encoding="utf-8") as f: info = json.load(f)
-        dataset_rows = info.get("dataset_rows", info.get("number_of_recordings", 2000))
-class_count = info.get("class_count", info.get("number_of_classes", 50))
-best_model = info.get("best_model", "Not available")
 
-st.caption(
-    f"Dataset: {dataset_rows} recordings · "
-    f"{class_count} classes · Best model: {best_model}"
-)
-        dataset_rows = info.get("dataset_rows", info.get("number_of_recordings", 2000))
-class_count = info.get("class_count", info.get("number_of_classes", 50))
-best_model = info.get("best_model", "Not available")
+    st.write(
+        "These results should come from the evaluation completed "
+        "in your Google Colab notebook."
+    )
 
-st.caption(
-    f"Dataset: {dataset_rows} recordings · "
-    f"{class_count} classes · Best model: {best_model}"
-)
+    try:
+        info = read_metrics()
 
-frame = pd.DataFrame(info.get("metrics", []))
-st.dataframe(frame, use_container_width=True)
-        for _, row in frame.iterrows():
-            st.markdown("### " + row["Model"])
-            cols = st.columns(4)
-            for col, key in zip(cols, ["Accuracy","Macro Precision","Macro Recall","Macro F1"]):
-                with col:
-                    st.markdown(f"<div class='metric-card'><div class='metric-label'>{key}</div><div class='metric-value'>{row[key]:.1%}</div></div>", unsafe_allow_html=True)
-            st.write("")
-        st.dataframe(frame.style.format({c:"{:.4f}" for c in frame.columns if c != "Model"}), use_container_width=True)
-        if os.path.exists("model_metrics.csv"):
-            st.download_button("Download metrics CSV", open("model_metrics.csv","rb"), file_name="model_metrics.csv", mime="text/csv")
+    except Exception as error:
+        info = {}
+        st.warning(f"Could not read model_metrics.json: {error}")
+
+    if info:
+        dataset_rows = first_present(
+            info,
+            ["number_of_recordings", "dataset_rows", "n_samples"],
+            2000
+        )
+
+        class_count = first_present(
+            info,
+            ["number_of_classes", "class_count", "n_classes"],
+            50
+        )
+
+        best_model = first_present(
+            info,
+            ["best_model", "selected_model", "model_name"],
+            "Not available"
+        )
+
+        st.caption(
+            f"Dataset: {dataset_rows} recordings · "
+            f"{class_count} classes · Best model: {best_model}"
+        )
+
+        metric_definitions = [
+            ("Accuracy", ["accuracy", "Accuracy"]),
+            ("Macro Precision", [
+                "macro_precision",
+                "precision_macro",
+                "Macro Precision"
+            ]),
+            ("Macro Recall", [
+                "macro_recall",
+                "recall_macro",
+                "Macro Recall"
+            ]),
+            ("Macro F1", [
+                "macro_f1",
+                "f1_macro",
+                "Macro F1"
+            ])
+        ]
+
+        columns = st.columns(4)
+
+        for col, (label, keys) in zip(columns, metric_definitions):
+            value = first_present(info, keys)
+
+            try:
+                display_value = (
+                    f"{float(value):.1%}"
+                    if value is not None
+                    else "N/A"
+                )
+
+            except (TypeError, ValueError):
+                display_value = (
+                    str(value) if value is not None else "N/A"
+                )
+
+            col.metric(label, display_value)
+
     else:
-        st.warning("Add model_metrics.json and model_metrics.csv generated by the notebook.")
+        st.info(
+            "model_metrics.json is missing or empty. "
+            "Upload the file generated by Colab beside app.py."
+        )
+
+    if METRICS_CSV_PATH.exists():
+        st.markdown("### Algorithm comparison")
+
+        try:
+            frame = pd.read_csv(METRICS_CSV_PATH)
+
+            percent_names = {
+                "accuracy",
+                "macro_precision",
+                "macro_recall",
+                "macro_f1",
+                "precision",
+                "recall",
+                "f1"
+            }
+
+            format_map = {
+                column: "{:.1%}"
+                for column in frame.columns
+                if column.lower() in percent_names
+            }
+
+            if format_map:
+                st.dataframe(
+                    frame.style.format(format_map),
+                    use_container_width=True,
+                    hide_index=True
+                )
+
+            else:
+                st.dataframe(
+                    frame,
+                    use_container_width=True,
+                    hide_index=True
+                )
+
+            st.download_button(
+                "Download metrics CSV",
+                data=frame.to_csv(index=False).encode("utf-8"),
+                file_name="auralert_model_metrics.csv",
+                mime="text/csv"
+            )
+
+        except Exception as error:
+            st.warning(
+                f"Could not display model_metrics.csv: {error}"
+            )
+
+    else:
+        st.info(
+            "Optional: upload model_metrics.csv to show "
+            "the algorithm comparison table."
+        )
+
+
+# ---------------- HOW IT WORKS ----------------
 
 with tab_about:
     st.subheader("How it works")
-    st.markdown("""
-    1. **Audio input:** upload an environmental sound.
-    2. **Feature extraction:** calculate MFCC and spectral features.
-    3. **Inference:** the saved classifier predicts one of 50 known categories.
-    4. **Evaluation:** view accuracy, macro precision, macro recall and macro F1 from five-fold testing.
 
-    **Models compared:** SVM, KNN and Random Forest.  
-    **Dataset:** ESC-50, 2,000 labelled five-second recordings.  
-    **Limitations:** the model always chooses among known classes and may misclassify unfamiliar, noisy, or mixed sounds. It is not a safety-critical alarm detector.
-    """)
+    st.markdown("""
+1. **Audio input:** Upload an environmental sound recording.
+2. **Preprocessing:** Librosa loads audio at a consistent sample rate.
+3. **Feature extraction:** Auralert calculates MFCC and spectral features.
+4. **Classification:** The trained scikit-learn model predicts a known sound category.
+5. **Evaluation:** The Model Performance tab displays saved evaluation metrics.
+
+**Technologies:** Python, Google Colab, ESC-50, Librosa, NumPy,
+Pandas, scikit-learn and Streamlit.
+
+**Limitations:** The model may misclassify unfamiliar, noisy, or overlapping
+sounds. It is an educational prototype, not a validated emergency,
+security, or safety-critical alarm.
+""")
+
+
 st.markdown("---")
-st.caption("Auralert · Environmental Sound Classification · Python + Librosa + Scikit-learn + Streamlit")
+
+st.caption(
+    "Auralert · Environmental Sound Classification · "
+    "Python + Librosa + Scikit-learn + Streamlit"
+)
